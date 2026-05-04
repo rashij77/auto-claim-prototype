@@ -1,20 +1,3 @@
-[
-  {
-    "requestId": "101-A-1777563156490",
-    "farmerId": "101",
-    "claimId": "A",
-    "farmerName": "Ramesh Patil",
-    "outcome": "ERROR",
-    "reason": "Weather API error: Request failed with status code 401",
-    "timestamp": "2026-04-30T15:32:36.669Z"
-  },
-  {
-    "requestId": "101-A-1777563166593",
-    "farmerId": "101",
-    "claimId": "A",
-    "farmerName": "Ramesh Patil",
-    "outcome": "ERROR",
-    "reason": "Weather API error: Request failed with status code 401",
-    "timestamp": "2026-04-30T15:32:46.645Z"
-  }
-]
+{
+  "claims": []
+}
