@@ -1,0 +1,36 @@
+[
+  {
+    "farmerId": "101",
+    "name": "Ramesh Patil",
+    "location": "Nashik, Maharashtra",
+    "lat": 19.9975,
+    "lon": 73.7898,
+    "cropType": "Onion",
+    "areaSqM": 5000,
+    "policy": {
+      "droughtThresholdMm": 2.0,
+      "floodThresholdMm": 50.0,
+      "heatThresholdC": 42.0,
+      "droughtPayoutINR": 45000,
+      "floodPayoutINR": 60000,
+      "heatPayoutINR": 30000
+    }
+  },
+  {
+    "farmerId": "102",
+    "name": "Sunita Deshmukh",
+    "location": "Pune, Maharashtra",
+    "lat": 18.5204,
+    "lon": 73.8567,
+    "cropType": "Sugarcane",
+    "areaSqM": 8000,
+    "policy": {
+      "droughtThresholdMm": 1.5,
+      "floodThresholdMm": 45.0,
+      "heatThresholdC": 40.0,
+      "droughtPayoutINR": 72000,
+      "floodPayoutINR": 90000,
+      "heatPayoutINR": 50000
+    }
+  }
+]
