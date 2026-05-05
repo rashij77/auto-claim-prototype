@@ -1,292 +1,316 @@
 /**
- * ============================================================
- *  AGRI-INSURANCE SYSTEM — SYSTEM 2: WEATHER ORACLE & PAYOUT LEDGER
- *  Professional-grade Node.js implementation
- *  No shortcuts. Production-ready. Fraud-prevention hardened.
- * ============================================================
+ * Automated Insurance Claim Backend
+ * app.js — Express server with biometric integration, claim processing, and JWT security
  */
 
 "use strict";
 
-// ── 1. ENVIRONMENT ────────────────────────────────────────────
-require("dotenv").config(); // Loads .env from project root
+const express = require("express");
+const { execFile } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const https = require("https");
+const jwt = require("jsonwebtoken");
+const multer = require("multer");
+const cors = require("cors");
 
-const express  = require("express");
-const axios    = require("axios");
-const fs       = require("fs");
-const path     = require("path");
+// ─── Config ──────────────────────────────────────────────────────────────────
 
-// ── 2. CONSTANTS & PATH RESOLUTION ────────────────────────────
-const PORT            = process.env.PORT || 3000;
-const OPENWEATHER_KEY = process.env.OPENWEATHER_API_KEY;
+const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || "CHANGE_ME_IN_PRODUCTION";
+const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY || "";
+const WEATHER_CITY = process.env.WEATHER_CITY || "Mumbai";
 
-// Always resolve paths relative to THIS file — never rely on cwd()
-const DATA_DIR        = path.join(__dirname, "data");
-const LAND_REGISTRY   = path.join(DATA_DIR, "landRegistry.json");
-const AUDIT_LOG       = path.join(DATA_DIR, "auditLog.json");
+const DATA_DIR = path.join(__dirname, "data");
+const LAND_REGISTRY_PATH = path.join(DATA_DIR, "landRegistry.json");
+const AUDIT_LOG_PATH = path.join(DATA_DIR, "auditLog.json");
+const PYTHON_SCRIPT = path.join(__dirname, "biometric-system", "face_recognition_system.py");
 
-// ── 3. BOOT-TIME SAFETY CHECKS ────────────────────────────────
-/**
- * Ensures the data/ directory exists and auditLog.json is initialised.
- * Called once before the server starts accepting requests.
- */
-function bootstrapDataLayer() {
-  // 3a. Create data/ directory if absent
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    console.log(`[BOOT] Created missing directory: ${DATA_DIR}`);
-  }
+// ─── App Setup ────────────────────────────────────────────────────────────────
 
-  // 3b. Create auditLog.json if absent
-  if (!fs.existsSync(AUDIT_LOG)) {
-    fs.writeFileSync(AUDIT_LOG, JSON.stringify([], null, 2), "utf8");
-    console.log(`[BOOT] Initialised empty audit log: ${AUDIT_LOG}`);
-  }
-
-  // 3c. Warn loudly if landRegistry.json is missing
-  if (!fs.existsSync(LAND_REGISTRY)) {
-    console.error(`[BOOT] CRITICAL: Land registry not found at ${LAND_REGISTRY}`);
-    console.error(`[BOOT] Create data/landRegistry.json before processing claims.`);
-  }
-
-  // 3d. Warn if API key is missing
-  if (!OPENWEATHER_KEY) {
-    console.warn("[BOOT] WARNING: OPENWEATHER_API_KEY is not set in .env — weather calls will fail.");
-  }
-}
-
-// ── 4. HELPER: APPEND TO AUDIT LOG ────────────────────────────
-/**
- * Appends a single audit entry to auditLog.json atomically.
- * Never throws — audit failure must not crash a live claim request.
- *
- * @param {object} entry - Structured audit record
- */
-function appendAuditLog(entry) {
-  try {
-    const raw      = fs.readFileSync(AUDIT_LOG, "utf8");
-    const log      = JSON.parse(raw);
-    log.push({ ...entry, timestamp: new Date().toISOString() });
-    fs.writeFileSync(AUDIT_LOG, JSON.stringify(log, null, 2), "utf8");
-  } catch (err) {
-    console.error("[AUDIT] Failed to write audit log:", err.message);
-  }
-}
-
-// ── 5. HELPER: FETCH WEATHER ───────────────────────────────────
-/**
- * Fetches current weather for a given lat/lon from OpenWeatherMap.
- * Returns a normalised object; throws on network/API failure.
- *
- * @param {number} lat
- * @param {number} lon
- * @returns {Promise<object>} Normalised weather payload
- */
-async function fetchWeather(lat, lon) {
-  const url = "https://api.openweathermap.org/data/2.5/weather";
-  const response = await axios.get(url, {
-    params: {
-      lat,
-      lon,
-      appid: OPENWEATHER_KEY,
-      units: "metric",
-    },
-    timeout: 8000, // 8-second hard timeout
-  });
-
-  const d = response.data;
-  return {
-    location       : d.name,
-    condition      : d.weather[0].main,
-    description    : d.weather[0].description,
-    temperatureC   : d.main.temp,
-    humidityPct    : d.main.humidity,
-    rainfallMm     : d.rain ? (d.rain["1h"] || d.rain["3h"] || 0) : 0,
-    windSpeedKmh   : parseFloat((d.wind.speed * 3.6).toFixed(2)),
-    observedAtUTC  : new Date(d.dt * 1000).toISOString(),
-  };
-}
-
-// ── 6. HELPER: PAYOUT DECISION ENGINE ─────────────────────────
-/**
- * Pure function — determines payout eligibility based on weather data
- * and the policy thresholds stored in the land record.
- *
- * Edit ONLY this function to change your fraud/payout rules.
- *
- * @param {object} weather      - Normalised weather payload
- * @param {object} landRecord   - Entry from landRegistry.json
- * @returns {{ eligible: boolean, reason: string, payoutINR: number }}
- */
-function evaluatePayout(weather, landRecord) {
-  const policy = landRecord.policy;
-
-  // Rule 1: Drought — rainfall below threshold
-  if (weather.rainfallMm < policy.droughtThresholdMm) {
-    return {
-      eligible  : true,
-      reason    : `Drought detected. Rainfall ${weather.rainfallMm} mm < threshold ${policy.droughtThresholdMm} mm.`,
-      payoutINR : policy.droughtPayoutINR,
-    };
-  }
-
-  // Rule 2: Flood — rainfall above threshold
-  if (weather.rainfallMm > policy.floodThresholdMm) {
-    return {
-      eligible  : true,
-      reason    : `Flood detected. Rainfall ${weather.rainfallMm} mm > threshold ${policy.floodThresholdMm} mm.`,
-      payoutINR : policy.floodPayoutINR,
-    };
-  }
-
-  // Rule 3: Extreme heat
-  if (weather.temperatureC > policy.heatThresholdC) {
-    return {
-      eligible  : true,
-      reason    : `Extreme heat detected. ${weather.temperatureC}°C > threshold ${policy.heatThresholdC}°C.`,
-      payoutINR : policy.heatPayoutINR,
-    };
-  }
-
-  // No trigger matched
-  return {
-    eligible  : false,
-    reason    : "Current weather conditions do not meet any policy trigger threshold.",
-    payoutINR : 0,
-  };
-}
-
-// ── 7. EXPRESS APPLICATION ─────────────────────────────────────
 const app = express();
-app.use(express.json());
+app.use(cors());
+app.use(express.json({ limit: "10mb" }));
 
-// ── 7a. HEALTH CHECK ──────────────────────────────────────────
-app.get("/health", (_req, res) => {
-  res.json({ status: "OK", service: "Agri-Insurance Weather Oracle", uptime: process.uptime() });
+// Multer: store uploaded biometric images in memory (no disk persistence)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB cap
+  fileFilter: (_req, file, cb) => {
+    if (!file.mimetype.startsWith("image/")) {
+      return cb(new Error("Only image files are accepted for biometric verification."));
+    }
+    cb(null, true);
+  },
 });
 
-// ── 7b. CORE ROUTE: PROCESS CLAIM ─────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
 /**
- * GET /process-claim/:farmerId/:claimId
- *
- * :farmerId — e.g. "101"
- * :claimId  — e.g. "A"
- *
- * Steps:
- *   1. Load land registry
- *   2. Locate farmer record
- *   3. Fetch live weather for the farm's coordinates
- *   4. Run payout decision engine
- *   5. Append immutable audit log entry
- *   6. Return structured JSON response
+ * Safely read and parse a JSON file.
+ * Returns `defaultValue` if the file is missing or malformed — server never crashes.
  */
-app.get("/process-claim/:farmerId/:claimId", async (req, res) => {
-  const { farmerId, claimId } = req.params;
-  const requestId = `${farmerId}-${claimId}-${Date.now()}`;
-
-  console.log(`\n[CLAIM] Processing request ${requestId}`);
-
-  // Step 1 — Load land registry
-  let registry;
+function readJSON(filePath, defaultValue = null) {
   try {
-    const raw = fs.readFileSync(LAND_REGISTRY, "utf8");
-    registry  = JSON.parse(raw);
+    const raw = fs.readFileSync(filePath, "utf8");
+    return JSON.parse(raw);
   } catch (err) {
-    console.error("[CLAIM] Failed to read land registry:", err.message);
-    return res.status(500).json({
-      success : false,
-      error   : "Internal error: Land registry unavailable.",
-      requestId,
+    if (err.code === "ENOENT") {
+      console.warn(`[WARN] File not found: ${filePath}. Using default.`);
+    } else {
+      console.error(`[ERROR] Failed to parse JSON at ${filePath}:`, err.message);
+    }
+    return defaultValue;
+  }
+}
+
+/**
+ * Safely write a JSON file atomically (write to tmp, then rename).
+ * Prevents corruption if the process dies mid-write.
+ */
+function writeJSON(filePath, data) {
+  const tmp = filePath + ".tmp";
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), "utf8");
+  fs.renameSync(tmp, filePath);
+}
+
+/**
+ * Fetch current weather from OpenWeatherMap.
+ * Resolves with weather object; rejects with a descriptive Error.
+ */
+function fetchWeather(city) {
+  return new Promise((resolve, reject) => {
+    if (!OPENWEATHER_API_KEY) {
+      // Graceful fallback when key is absent (dev/testing)
+      return resolve({ condition: "unknown", temperature: null, note: "API key not configured" });
+    }
+    const url = `https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(city)}&appid=${OPENWEATHER_API_KEY}&units=metric`;
+    https.get(url, (res) => {
+      let body = "";
+      res.on("data", (chunk) => (body += chunk));
+      res.on("end", () => {
+        try {
+          const json = JSON.parse(body);
+          if (json.cod !== 200) return reject(new Error(`Weather API error: ${json.message}`));
+          resolve({
+            condition: json.weather?.[0]?.main ?? "N/A",
+            description: json.weather?.[0]?.description ?? "N/A",
+            temperature: json.main?.temp ?? null,
+            humidity: json.main?.humidity ?? null,
+            city: json.name,
+            fetchedAt: new Date().toISOString(),
+          });
+        } catch {
+          reject(new Error("Failed to parse weather response."));
+        }
+      });
+    }).on("error", (err) => reject(new Error(`Weather HTTP error: ${err.message}`)));
+  });
+}
+
+/**
+ * JWT middleware — verifies the bearer token and injects `req.user`.
+ */
+function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "Authorization token required." });
+
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch (err) {
+    const message = err.name === "TokenExpiredError" ? "Token has expired." : "Invalid token.";
+    return res.status(401).json({ error: message });
+  }
+}
+
+/**
+ * Middleware — ensures the JWT payload confirms biometric verification was done.
+ * A token issued without `biometricVerified: true` is rejected here.
+ */
+function requireBiometric(req, res, next) {
+  if (!req.user?.biometricVerified) {
+    return res.status(403).json({
+      error: "Biometric verification is required before submitting a claim.",
     });
   }
+  next();
+}
 
-  // Step 2 — Find farmer
-  const farmerRecord = registry.find(
-    (r) => String(r.farmerId) === String(farmerId)
+// ─── Route: POST /verify-identity ─────────────────────────────────────────────
+/**
+ * Accepts a multipart image upload, pipes it to the Python face-recognition
+ * script via stdin, and returns a JWT that encodes the biometric result.
+ *
+ * Data flow:
+ *   Browser  →  (multipart/form-data image)  →  /verify-identity
+ *   Node     →  spawn python face_recognition_system.py
+ *   Node     →  write image bytes to python stdin
+ *   Python   →  reads stdin, runs TensorFlow model, prints JSON to stdout
+ *   Node     →  parses stdout, issues JWT { userId, biometricVerified }
+ *   Browser  ←  JWT (stored client-side, attached to /submit-claim)
+ */
+app.post("/verify-identity", upload.single("image"), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: "No image file received. Send it as 'image' field." });
+  }
+
+  const userId = req.body.userId;
+  if (!userId) {
+    return res.status(400).json({ error: "'userId' field is required." });
+  }
+
+  // Spawn Python script — we communicate via stdin/stdout (no temp files)
+  const python = execFile(
+    "python3",
+    [PYTHON_SCRIPT],
+    { timeout: 30_000, maxBuffer: 1024 * 512 },
+    (err, stdout, stderr) => {
+      if (err) {
+        // Python crashed or timed out — log the stderr for ops, return generic error to client
+        console.error("[biometric] Python error:", err.message);
+        console.error("[biometric] stderr:", stderr);
+        return res.status(503).json({
+          error: "Biometric service is temporarily unavailable. Please try again.",
+        });
+      }
+
+      // Parse the JSON line printed by the Python script
+      let result;
+      try {
+        result = JSON.parse(stdout.trim());
+      } catch {
+        console.error("[biometric] Unexpected Python output:", stdout);
+        return res.status(500).json({ error: "Biometric system returned an unreadable response." });
+      }
+
+      const verified = result.status === "Success";
+
+      // Issue a short-lived JWT encoding the biometric outcome
+      const token = jwt.sign(
+        { userId, biometricVerified: verified, verifiedAt: new Date().toISOString() },
+        JWT_SECRET,
+        { expiresIn: "15m" } // claim must be submitted within 15 minutes
+      );
+
+      return res.json({
+        verified,
+        message: verified ? "Identity verified successfully." : "Biometric verification failed.",
+        token, // sent back only so the client can use it on /submit-claim
+        confidence: result.confidence ?? null,
+      });
+    }
   );
 
-  if (!farmerRecord) {
-    console.warn(`[CLAIM] Farmer ${farmerId} not found in registry.`);
-    appendAuditLog({
-      requestId, farmerId, claimId,
-      outcome: "REJECTED", reason: "Farmer ID not found in land registry.",
-    });
-    return res.status(404).json({
-      success   : false,
-      requestId,
-      farmerId,
-      claimId,
-      outcome   : "REJECTED",
-      reason    : `Farmer ID '${farmerId}' does not exist in the land registry.`,
-    });
+  // Stream image buffer into Python stdin
+  python.stdin.write(req.file.buffer);
+  python.stdin.end();
+});
+
+// ─── Route: POST /submit-claim ────────────────────────────────────────────────
+/**
+ * Protected by:
+ *   1. requireAuth  — valid JWT must be present
+ *   2. requireBiometric — JWT must carry biometricVerified: true
+ *
+ * Data flow:
+ *   Browser  →  POST /submit-claim  (Bearer <token>, JSON body)
+ *   Node     →  validates JWT → checks biometricVerified flag
+ *   Node     →  reads landRegistry.json → checks userId exists
+ *   Node     →  calls OpenWeatherMap API → fetches current weather
+ *   Node     →  appends claim + weather snapshot to auditLog.json
+ *   Browser  ←  { claimId, status: "Pending", weather }
+ */
+app.post("/submit-claim", requireAuth, requireBiometric, async (req, res) => {
+  const { userId, claimType, description, location, amount } = req.body;
+
+  // Basic field validation
+  if (!userId || !claimType || !description) {
+    return res.status(400).json({ error: "userId, claimType, and description are required." });
   }
 
-  // Step 3 — Fetch live weather
+  // Ensure the authenticated user isn't spoofing a different userId
+  if (req.user.userId !== userId) {
+    return res.status(403).json({ error: "userId does not match the authenticated token." });
+  }
+
+  // ── Step 1: Validate userId against Land Registry ──────────────────────────
+  const registry = readJSON(LAND_REGISTRY_PATH, { users: [] });
+  const registeredUser = (registry.users ?? []).find((u) => u.id === userId);
+  if (!registeredUser) {
+    return res.status(404).json({ error: `User ID '${userId}' not found in the land registry.` });
+  }
+
+  // ── Step 2: Fetch weather context ─────────────────────────────────────────
   let weather;
   try {
-    weather = await fetchWeather(farmerRecord.lat, farmerRecord.lon);
-    console.log(`[CLAIM] Weather fetched for ${farmerRecord.name}:`, weather.condition, `${weather.temperatureC}°C`);
+    weather = await fetchWeather(location ?? WEATHER_CITY);
   } catch (err) {
-    console.error("[CLAIM] Weather API failure:", err.message);
-    appendAuditLog({
-      requestId, farmerId, claimId, farmerName: farmerRecord.name,
-      outcome: "ERROR", reason: `Weather API error: ${err.message}`,
-    });
-    return res.status(502).json({
-      success   : false,
-      requestId,
-      error     : "Weather Oracle temporarily unavailable. Try again shortly.",
-      detail    : err.message,
-    });
+    console.error("[weather] Fetch failed:", err.message);
+    // Non-fatal: log the warning and continue with null weather
+    weather = { condition: "unavailable", error: err.message };
   }
 
-  // Step 4 — Evaluate payout
-  const decision = evaluatePayout(weather, farmerRecord);
-  console.log(`[CLAIM] Decision for ${farmerRecord.name}: eligible=${decision.eligible}`);
+  // ── Step 3: Append to Audit Log ───────────────────────────────────────────
+  const auditLog = readJSON(AUDIT_LOG_PATH, { claims: [] });
+  if (!Array.isArray(auditLog.claims)) auditLog.claims = [];
 
-  // Step 5 — Write immutable audit entry
-  appendAuditLog({
-    requestId,
-    farmerId,
+  const claimId = `CLM-${Date.now()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
+  const newClaim = {
     claimId,
-    farmerName    : farmerRecord.name,
-    farmLocation  : farmerRecord.location,
+    userId,
+    userName: registeredUser.name ?? "Unknown",
+    claimType,
+    description,
+    amount: amount ?? null,
+    location: location ?? WEATHER_CITY,
+    status: "Pending",
+    biometricVerifiedAt: req.user.verifiedAt,
     weather,
-    decision,
-    outcome       : decision.eligible ? "APPROVED" : "REJECTED",
-  });
+    submittedAt: new Date().toISOString(),
+  };
 
-  // Step 6 — Respond
-  return res.status(200).json({
-    success       : true,
-    requestId,
-    farmerId,
+  auditLog.claims.push(newClaim);
+
+  try {
+    writeJSON(AUDIT_LOG_PATH, auditLog);
+  } catch (err) {
+    console.error("[audit] Failed to write auditLog.json:", err.message);
+    return res.status(500).json({ error: "Failed to persist claim. Please retry." });
+  }
+
+  return res.status(201).json({
+    message: "Claim submitted successfully.",
     claimId,
-    farmerName    : farmerRecord.name,
-    farmLocation  : farmerRecord.location,
+    status: "Pending",
     weather,
-    decision,
-    outcome       : decision.eligible ? "APPROVED" : "REJECTED",
+    submittedAt: newClaim.submittedAt,
   });
 });
 
-// ── 7c. 404 FALLBACK ──────────────────────────────────────────
-app.use((req, res) => {
-  res.status(404).json({
-    error   : `Route not found: ${req.method} ${req.path}`,
-    hint    : "Valid routes: GET /health, GET /process-claim/:farmerId/:claimId",
-  });
+// ─── Route: GET /health ───────────────────────────────────────────────────────
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-// ── 8. START SERVER ────────────────────────────────────────────
-bootstrapDataLayer(); // Run safety checks before binding port
+// ─── Global Error Handler ─────────────────────────────────────────────────────
+// Catches multer errors (wrong file type, size exceeded) and any other unhandled throws
+app.use((err, _req, res, _next) => {
+  console.error("[ERROR]", err.message);
+  if (err.code === "LIMIT_FILE_SIZE") {
+    return res.status(413).json({ error: "Image file too large. Maximum size is 5 MB." });
+  }
+  res.status(400).json({ error: err.message || "Unexpected server error." });
+});
 
+// ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log("\n╔══════════════════════════════════════════════════╗");
-  console.log(`║  Agri-Insurance Weather Oracle                   ║`);
-  console.log(`║  LIVE on http://localhost:${PORT}                   ║`);
-  console.log("╠══════════════════════════════════════════════════╣");
-  console.log(`║  Test:  GET /process-claim/101/A                 ║`);
-  console.log(`║  Health: GET /health                             ║`);
-  console.log("╚══════════════════════════════════════════════════╝\n");
+  console.log(`[server] Insurance Claim API running on http://localhost:${PORT}`);
+  console.log(`[server] Land registry : ${LAND_REGISTRY_PATH}`);
+  console.log(`[server] Audit log     : ${AUDIT_LOG_PATH}`);
+  console.log(`[server] Python script : ${PYTHON_SCRIPT}`);
 });
+
+module.exports = app; // for testing
